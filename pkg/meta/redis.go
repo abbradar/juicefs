@@ -21,6 +21,7 @@ package meta
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -43,6 +44,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dustin/go-humanize"
 
@@ -94,6 +97,7 @@ type redisMeta struct {
 	prefix     string
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
+	safeGlob   bool   // Whether glob matching is safe for patterns built from file names
 	cache      *redisCache
 }
 
@@ -988,7 +992,7 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 			return !exists || oldEntry.term < entryTerm
 		})
 	}
-	if len(m.shaLookup) > 0 && attr != nil && !m.conf.CaseInsensi && m.prefix == "" {
+	if len(m.shaLookup) > 0 && attr != nil && m.prefix == "" {
 		var res interface{}
 		var returnedIno int64
 		var returnedAttr string
@@ -1029,6 +1033,101 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 	}
 	*inode = foundIno
 	return errno(err)
+}
+
+// caseInsensitiveGlob returns a glob pattern matching every name equal to name under Unicode simple case folding.
+// It may match other names too, so the results must still be checked with strings.EqualFold.
+func caseInsensitiveGlob(name string) string {
+	var b strings.Builder
+	var star bool
+	var orbit []rune
+	var enc [utf8.UTFMax]byte
+	class := func(bs []byte) {
+		if len(bs) == 1 {
+			if strings.IndexByte(`*?[]\`, bs[0]) >= 0 {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(bs[0])
+			return
+		}
+		b.WriteByte('[')
+		for _, c := range bs {
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		}
+		b.WriteByte(']')
+	}
+	for _, r := range name {
+		// invalid UTF-8 is equal to any other invalid UTF-8 or U+FFFD
+		if r == utf8.RuneError {
+			if !star {
+				b.WriteByte('*')
+				star = true
+			}
+			continue
+		}
+		orbit = append(orbit[:0], r)
+		size := utf8.RuneLen(r)
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			orbit = append(orbit, f)
+			if utf8.RuneLen(f) != size {
+				size = 0
+			}
+		}
+		if size == 0 {
+			// characters with encodings of different lengths, like k and U+212A (Kelvin sign)
+			var first []byte
+			for _, f := range orbit {
+				utf8.EncodeRune(enc[:], f)
+				if bytes.IndexByte(first, enc[0]) < 0 {
+					first = append(first, enc[0])
+				}
+			}
+			class(first)
+			b.WriteByte('*')
+			star = true
+			continue
+		}
+		for i := 0; i < size; i++ {
+			var bs []byte
+			for _, f := range orbit {
+				utf8.EncodeRune(enc[:], f)
+				if bytes.IndexByte(bs, enc[i]) < 0 {
+					bs = append(bs, enc[i])
+				}
+			}
+			class(bs)
+		}
+		star = false
+	}
+	return b.String()
+}
+
+// doResolveCase lets Redis filter directory entries with a case-insensitive glob,
+// so only candidates are transferred instead of the whole directory.
+func (m *redisMeta) doResolveCase(ctx Context, parent Ino, name string) (*Entry, error) {
+	if !m.safeGlob {
+		return nil, syscall.ENOTSUP
+	}
+	key := m.entryKey(parent)
+	pattern := caseInsensitiveGlob(name)
+	var cursor uint64
+	for {
+		kvs, next, err := m.rdb.HScan(ctx, key, cursor, pattern, 10000).Result()
+		if err != nil {
+			return nil, err
+		}
+		for i := 0; i+1 < len(kvs); i += 2 {
+			if kvs[i] != "" && strings.EqualFold(name, kvs[i]) {
+				typ, ino := m.parseEntry([]byte(kvs[i+1]))
+				return &Entry{Inode: ino, Name: []byte(kvs[i]), Attr: &Attr{Typ: typ}}, nil
+			}
+		}
+		if next == 0 {
+			return nil, nil
+		}
+		cursor = next
+	}
 }
 
 func (m *redisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr, force bool) syscall.Errno {
@@ -4663,6 +4762,7 @@ func (m *redisMeta) checkServerConfig() {
 	if err != nil {
 		logger.Warnf("parse info: %s", err)
 	}
+	m.safeGlob = rInfo.safeGlob
 	if rInfo.storageProvider == "" && rInfo.maxMemoryPolicy != "" && rInfo.maxMemoryPolicy != "noeviction" {
 		logger.Warnf("maxmemory_policy is %q,  we will try to reconfigure it to 'noeviction'.", rInfo.maxMemoryPolicy)
 		if _, err := m.rdb.ConfigSet(Background(), "maxmemory-policy", "noeviction").Result(); err != nil {

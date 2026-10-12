@@ -1701,6 +1701,33 @@ func testCaseIncensi(t *testing.T, m Meta) {
 	if st := m.Rmdir(ctx, 1, "foo"); st != 0 {
 		t.Fatalf("rmdir foo should be OK")
 	}
+	// non-ASCII characters that fold to ASCII ones
+	if st := m.Create(ctx, 1, "Kelvin", 0755, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create Kelvin should be OK, but got %s", st)
+	}
+	if st := m.Lookup(ctx, 1, "\u212aELVIN", &inode, attr, true); st != 0 {
+		t.Fatalf("lookup with Kelvin sign should be OK, but got %s", st)
+	}
+	if st := m.Create(ctx, 1, "ſecret", 0755, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create ſecret should be OK, but got %s", st)
+	}
+	if st := m.Create(ctx, 1, "SECRET", 0755, 0, syscall.O_EXCL, &inode, attr); st != syscall.EEXIST {
+		t.Fatalf("create SECRET should fail with EEXIST, but got %s", st)
+	}
+	if st := m.Create(ctx, 1, "Straße", 0755, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create Straße should be OK, but got %s", st)
+	}
+	if st := m.Lookup(ctx, 1, "STRAẞE", &inode, attr, true); st != 0 {
+		t.Fatalf("lookup STRAẞE should be OK, but got %s", st)
+	}
+	if st := m.Lookup(ctx, 1, "strasse", &inode, attr, true); st != syscall.ENOENT {
+		t.Fatalf("lookup strasse should fail with ENOENT, but got %s", st)
+	}
+	for _, name := range []string{"kelvin", "SECRET", "straße"} {
+		if st := m.Unlink(ctx, 1, name); st != 0 {
+			t.Fatalf("unlink %s should be OK, but got %s", name, st)
+		}
+	}
 }
 
 func testCaseIncensiRename(t *testing.T, m Meta) {

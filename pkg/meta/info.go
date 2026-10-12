@@ -58,10 +58,33 @@ func (ver redisVersion) String() string {
 	return ver.ver
 }
 
+// hasSafeGlob reports whether the server has the fix for CVE-2022-36021,
+// without which matching a glob pattern with many '*' can take exponential time.
+func hasSafeGlob(version string) bool {
+	ver, err := parseRedisVersion(version)
+	if err != nil {
+		return false
+	}
+	var patch int
+	if parts := strings.Split(version, "."); len(parts) > 2 {
+		patch, _ = strconv.Atoi(parts[2])
+	}
+	switch {
+	case ver.major == 6 && ver.minor == 0:
+		return patch >= 18
+	case ver.major == 6 && ver.minor == 2:
+		return patch >= 11
+	case ver.major == 7 && ver.minor == 0:
+		return patch >= 9
+	}
+	return !ver.olderThan(redisVersion{"7.1", 7, 1})
+}
+
 type redisInfo struct {
 	aofEnabled      bool
 	maxMemoryPolicy string
 	redisVersion    string
+	safeGlob        bool
 	storageProvider string // redis is "", keyDB is "none" or "flash"
 }
 
@@ -87,6 +110,7 @@ func checkRedisInfo(rawInfo string) (info redisInfo, err error) {
 			info.maxMemoryPolicy = val
 		case "redis_version":
 			info.redisVersion = val
+			info.safeGlob = hasSafeGlob(val)
 			ver, err := parseRedisVersion(val)
 			if err != nil {
 				logger.Warnf("Failed to parse Redis server version %q: %s", ver, err)

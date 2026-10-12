@@ -1253,7 +1253,22 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 	return 0
 }
 
+// caseResolver is implemented by engines that can find a case-insensitive match
+// without loading the whole directory.
+type caseResolver interface {
+	doResolveCase(ctx Context, parent Ino, name string) (*Entry, error)
+}
+
 func (m *baseMeta) resolveCase(ctx Context, parent Ino, name string) *Entry {
+	if r, ok := m.en.(caseResolver); ok {
+		e, err := r.doResolveCase(ctx, parent, name)
+		if err == nil {
+			return e
+		}
+		if err != syscall.ENOTSUP {
+			logger.Warnf("Resolve case of %s in directory %d: %s, fall back to listing", name, parent, err)
+		}
+	}
 	var entries []*Entry
 	_ = m.en.doReaddir(ctx, parent, 0, &entries, -1)
 	for _, e := range entries {
