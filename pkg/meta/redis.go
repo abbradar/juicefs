@@ -95,6 +95,7 @@ type redisMeta struct {
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
 	cache      *redisCache
+	replica    *redisReplica
 }
 
 var _ Meta = (*redisMeta)(nil)
@@ -133,6 +134,11 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	// Default TTL to prevent reading stale cache for a long time when the connection fails.
 	clientCacheExpiry := query.duration("client-cache-expire", "client_cache_expire", time.Minute)
 	clientCachePreload := query.getInt("client-cache-preload", "client_cache_preload", 0) // may cause conflict
+
+	// Read replica options
+	readReplica := query.pop("read-replica")
+	replicaMaxLag := query.duration("read-replica-max-lag", "read_replica_max_lag", time.Second*5)
+	replicaTimeout := query.duration("read-replica-timeout", "read_replica_timeout", time.Second*10)
 	u.RawQuery = values.Encode()
 
 	hosts := u.Host
@@ -283,6 +289,22 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		rdb:      rdb,
 		prefix:   prefix,
 	}
+	if readReplica != "" {
+		if _, ok := rdb.(*redis.ClusterClient); ok {
+			_ = rdb.Close()
+			return nil, fmt.Errorf("read-replica is not supported with Redis Cluster")
+		}
+		ropt := *opt
+		ropt.Addr = readReplica
+		ropt.MaxRetries = -1 // failed reads are retried on the primary
+		ropt.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
+		m.replica = newRedisReplica(redis.NewClient(&ropt), rdb, prefix+"replicaFence", replicaMaxLag, replicaTimeout)
+		rdb.AddHook(m.replica)
+		if clientCache {
+			logger.Warnf("Client-side caching is not supported with a read replica, disable it")
+			clientCache = false
+		}
+	}
 	if clientCache {
 		m.cache = newRedisCache(prefix, clientCacheSize, clientCacheExpiry, clientCachePreload)
 		if err = m.cache.init(m.rdb); err != nil {
@@ -301,7 +323,29 @@ func (m *redisMeta) Shutdown() error {
 		m.cache.close()
 		m.cache = nil
 	}
+	if m.replica != nil {
+		_ = m.replica.close()
+	}
 	return m.rdb.Close()
+}
+
+type readPrimaryKey struct{}
+
+// reader returns the client for reads which can be served by the read replica.
+func (m *redisMeta) reader(ctx context.Context) redis.UniversalClient {
+	if m.replica != nil && m.replica.usable.Load() && ctx.Value(readPrimaryKey{}) == nil {
+		return m.replica.cli
+	}
+	return m.rdb
+}
+
+// loadScript loads a script into the primary and the read replica, they don't share the script cache.
+func (m *redisMeta) loadScript(script string) (string, error) {
+	sha, err := m.rdb.ScriptLoad(Background(), script).Result()
+	if err != nil || m.replica == nil {
+		return sha, err
+	}
+	return sha, m.replica.cli.ScriptLoad(Background(), script).Err()
 }
 
 // Override NewSession to initialize client-side cache after session is created
@@ -410,7 +454,7 @@ func (m *redisMeta) cacheACLs(ctx Context) error {
 		return nil
 	}
 
-	vals, err := m.rdb.HGetAll(ctx, m.aclKey()).Result()
+	vals, err := m.reader(ctx).HGetAll(ctx, m.aclKey()).Result()
 	if err != nil {
 		return err
 	}
@@ -434,7 +478,7 @@ func (m *redisMeta) Reset() error {
 }
 
 func (m *redisMeta) doLoad() ([]byte, error) {
-	body, err := m.rdb.Get(Background(), m.setting()).Bytes()
+	body, err := m.reader(Background()).Get(Background(), m.setting()).Bytes()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -455,11 +499,11 @@ func (m *redisMeta) doNewSession(sinfo []byte, update bool) error {
 		return fmt.Errorf("new session %d: %s", m.sid, err)
 	}
 
-	if m.shaLookup, err = m.rdb.ScriptLoad(Background(), scriptLookup).Result(); err != nil {
+	if m.shaLookup, err = m.loadScript(scriptLookup); err != nil {
 		logger.Warnf("load scriptLookup: %v", err)
 		m.shaLookup = ""
 	}
-	if m.shaResolve, err = m.rdb.ScriptLoad(Background(), scriptResolve).Result(); err != nil {
+	if m.shaResolve, err = m.loadScript(scriptResolve); err != nil {
 		logger.Warnf("load scriptResolve: %v", err)
 		m.shaResolve = ""
 	}
@@ -471,7 +515,7 @@ func (m *redisMeta) doNewSession(sinfo []byte, update bool) error {
 }
 
 func (m *redisMeta) getCounter(name string) (int64, error) {
-	v, err := m.rdb.Get(Background(), m.counterKey(name)).Int64()
+	v, err := m.reader(Background()).Get(Background(), m.counterKey(name)).Int64()
 	if err == redis.Nil {
 		err = nil
 	}
@@ -911,9 +955,9 @@ func (m *redisMeta) handleLuaResult(op string, res interface{}, err error, retur
 			var err2 error
 			switch op {
 			case "lookup":
-				m.shaLookup, err2 = m.rdb.ScriptLoad(Background(), scriptLookup).Result()
+				m.shaLookup, err2 = m.loadScript(scriptLookup)
 			case "resolve":
-				m.shaResolve, err2 = m.rdb.ScriptLoad(Background(), scriptResolve).Result()
+				m.shaResolve, err2 = m.loadScript(scriptResolve)
 			default:
 				return syscall.ENOTSUP
 			}
@@ -988,11 +1032,12 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 			return !exists || oldEntry.term < entryTerm
 		})
 	}
+	rd := m.reader(ctx)
 	if len(m.shaLookup) > 0 && attr != nil && !m.conf.CaseInsensi && m.prefix == "" {
 		var res interface{}
 		var returnedIno int64
 		var returnedAttr string
-		res, err = m.rdb.EvalSha(ctx, m.shaLookup, []string{entryKey, name}).Result()
+		res, err = rd.EvalSha(ctx, m.shaLookup, []string{entryKey, name}).Result()
 		if st := m.handleLuaResult("lookup", res, err, &returnedIno, &returnedAttr); st == 0 {
 			foundIno = Ino(returnedIno)
 			encodedAttr = []byte(returnedAttr)
@@ -1004,12 +1049,12 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 	}
 	if foundIno == 0 || len(encodedAttr) == 0 {
 		var buf []byte
-		buf, err = m.rdb.HGet(ctx, entryKey, name).Bytes()
+		buf, err = rd.HGet(ctx, entryKey, name).Bytes()
 		if err != nil {
 			return errno(err)
 		}
 		foundType, foundIno = m.parseEntry(buf)
-		encodedAttr, err = m.rdb.Get(ctx, m.inodeKey(foundIno)).Bytes()
+		encodedAttr, err = rd.Get(ctx, m.inodeKey(foundIno)).Bytes()
 	}
 
 	if err == nil {
@@ -1046,7 +1091,7 @@ func (m *redisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, at
 	for _, gid := range ctx.Gids() {
 		gids = append(gids, strconv.FormatUint(uint64(gid), 10))
 	}
-	res, err := m.rdb.EvalSha(ctx, m.shaResolve, keys, gids...).Result()
+	res, err := m.reader(ctx).EvalSha(ctx, m.shaResolve, keys, gids...).Result()
 	var returnedIno int64
 	var returnedAttr string
 	st := m.handleLuaResult("resolve", res, err, &returnedIno, &returnedAttr)
@@ -1062,7 +1107,7 @@ func (m *redisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, at
 }
 
 func (m *redisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
-	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+	a, err := m.reader(ctx).Get(ctx, m.inodeKey(inode)).Bytes()
 	if err == nil {
 		m.parseAttr(a, attr)
 	}
@@ -1406,7 +1451,7 @@ func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode
 
 func (m *redisMeta) doReadlink(ctx Context, inode Ino, noatime bool) (atime int64, target []byte, err error) {
 	if noatime {
-		target, err = m.rdb.Get(ctx, m.symKey(inode)).Bytes()
+		target, err = m.reader(ctx).Get(ctx, m.symKey(inode)).Bytes()
 		if err == redis.Nil {
 			err = nil
 		}
@@ -1485,7 +1530,7 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 		if err == nil {
 			foundType, foundIno = m.parseEntry(buf)
 		} else if m.conf.CaseInsensi { // err == redis.Nil
-			if entry := m.resolveCase(ctx, parent, name); entry != nil {
+			if entry := m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parent, name); entry != nil {
 				foundType, foundIno = entry.Attr.Typ, entry.Inode
 			}
 		}
@@ -1769,7 +1814,7 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, s
 		newSpace, newInode = 0, 0
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
-			if e := m.resolveCase(ctx, parent, name); e != nil {
+			if e := m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parent, name); e != nil {
 				name = string(e.Name)
 				buf = m.packEntry(e.Attr.Typ, e.Inode)
 				err = nil
@@ -2316,7 +2361,7 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 		trash = requestedTrash
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
-			if e := m.resolveCase(ctx, parent, name); e != nil {
+			if e := m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parent, name); e != nil {
 				name = string(e.Name)
 				buf = m.packEntry(e.Attr.Typ, e.Inode)
 				err = nil
@@ -2453,7 +2498,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		newSpace, newInode = 0, 0
 		buf, err := tx.HGet(ctx, m.entryKey(parentSrc), nameSrc).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
-			if e := m.resolveCase(ctx, parentSrc, nameSrc); e != nil {
+			if e := m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parentSrc, nameSrc); e != nil {
 				nameSrc = string(e.Name)
 				buf = m.packEntry(e.Attr.Typ, e.Inode)
 				err = nil
@@ -2473,7 +2518,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 
 		dbuf, err := tx.HGet(ctx, m.entryKey(parentDst), nameDst).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
-			if e := m.resolveCase(ctx, parentDst, nameDst); e != nil {
+			if e := m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parentDst, nameDst); e != nil {
 				if (nameSrc != string(e.Name)) || parentDst != parentSrc {
 					nameDst = string(e.Name)
 					dbuf = m.packEntry(e.Attr.Typ, e.Inode)
@@ -2811,7 +2856,7 @@ func (m *redisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *At
 			return err
 		} else if err == nil {
 			return syscall.EEXIST
-		} else if err == redis.Nil && m.conf.CaseInsensi && m.resolveCase(ctx, parent, name) != nil {
+		} else if err == redis.Nil && m.conf.CaseInsensi && m.resolveCase(ctx.WithValue(readPrimaryKey{}, true), parent, name) != nil {
 			return syscall.EEXIST
 		}
 
@@ -2843,7 +2888,7 @@ func (m *redisMeta) fillAttr(ctx Context, es []*Entry) error {
 	for i, e := range es {
 		keys[i] = m.inodeKey(e.Inode)
 	}
-	rs, err := m.rdb.MGet(ctx, keys...).Result()
+	rs, err := m.reader(ctx).MGet(ctx, keys...).Result()
 	if err != nil {
 		return err
 	}
@@ -2860,7 +2905,7 @@ func (m *redisMeta) fillAttr(ctx Context, es []*Entry) error {
 
 func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno {
 	var stop = errors.New("stop")
-	err := m.hscan(ctx, m.entryKey(inode), func(keys []string) error {
+	err := m.hscanWith(ctx, m.reader(ctx), m.entryKey(inode), func(keys []string) error {
 		newEntries := make([]Entry, len(keys)/2)
 		newAttrs := make([]Attr, len(keys)/2)
 		for i := 0; i < len(keys); i += 2 {
@@ -3087,7 +3132,7 @@ func (m *redisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 }
 
 func (m *redisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno) {
-	vals, err := m.rdb.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+	vals, err := m.reader(ctx).LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -3100,7 +3145,7 @@ func (m *redisMeta) doList(ctx Context, inode Ino) ([]*slice, syscall.Errno) {
 	if err != 0 {
 		return nil, err
 	}
-	p := m.rdb.Pipeline()
+	p := m.reader(ctx).Pipeline()
 	var slices []*slice
 	var indx uint32
 	for uint64(indx)*ChunkSize < attr.Length {
@@ -3436,15 +3481,15 @@ func (m *redisMeta) doUpdateDirStat(ctx Context, batch map[Ino]dirStat) error {
 
 func (m *redisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, syscall.Errno) {
 	field := ino.String()
-	dataLength, errLength := m.rdb.HGet(ctx, m.dirDataLengthKey(), field).Int64()
+	dataLength, errLength := m.reader(ctx).HGet(ctx, m.dirDataLengthKey(), field).Int64()
 	if errLength != nil && errLength != redis.Nil {
 		return nil, errno(errLength)
 	}
-	usedSpace, errSpace := m.rdb.HGet(ctx, m.dirUsedSpaceKey(), field).Int64()
+	usedSpace, errSpace := m.reader(ctx).HGet(ctx, m.dirUsedSpaceKey(), field).Int64()
 	if errSpace != nil && errSpace != redis.Nil {
 		return nil, errno(errSpace)
 	}
-	usedInodes, errInodes := m.rdb.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
+	usedInodes, errInodes := m.reader(ctx).HGet(ctx, m.dirUsedInodesKey(), field).Int64()
 	if errInodes != nil && errInodes != redis.Nil {
 		return nil, errno(errInodes)
 	}
@@ -3968,9 +4013,14 @@ func (m *redisMeta) scan(ctx context.Context, pattern string, f func([]string) e
 }
 
 func (m *redisMeta) hscan(ctx context.Context, key string, f func([]string) error) error {
+	return m.hscanWith(ctx, m.rdb, key, f)
+}
+
+// hscanWith reads all pages from cli, cursors from different servers can't be mixed.
+func (m *redisMeta) hscanWith(ctx context.Context, cli redis.UniversalClient, key string, f func([]string) error) error {
 	var cursor uint64
 	for {
-		keys, c, err := m.rdb.HScan(ctx, key, cursor, "*", 10000).Result()
+		keys, c, err := cli.HScan(ctx, key, cursor, "*", 10000).Result()
 		if err != nil {
 			logger.Warnf("HSCAN %s: %s", key, err)
 			return err
@@ -4296,7 +4346,7 @@ func (m *redisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte)
 	defer m.timeit("GetXattr", time.Now())
 	inode = m.checkRoot(inode)
 	var err error
-	*vbuff, err = m.rdb.HGet(ctx, m.xattrKey(inode), name).Bytes()
+	*vbuff, err = m.reader(ctx).HGet(ctx, m.xattrKey(inode), name).Bytes()
 	if err == redis.Nil {
 		err = ENOATTR
 	}
@@ -4306,7 +4356,7 @@ func (m *redisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte)
 func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno {
 	defer m.timeit("ListXattr", time.Now())
 	inode = m.checkRoot(inode)
-	vals, err := m.rdb.HKeys(ctx, m.xattrKey(inode)).Result()
+	vals, err := m.reader(ctx).HKeys(ctx, m.xattrKey(inode)).Result()
 	if err != nil {
 		return errno(err)
 	}
@@ -6259,7 +6309,7 @@ func (s *redisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno
 	defer s.Unlock()
 	if s.entries == nil {
 		var entries []*Entry
-		err := s.en.hscan(ctx, s.en.entryKey(s.inode), func(keys []string) error {
+		err := s.en.hscanWith(ctx, s.en.reader(ctx), s.en.entryKey(s.inode), func(keys []string) error {
 			newEntries := make([]Entry, len(keys)/2)
 			newAttrs := make([]Attr, len(keys)/2)
 			for i := 0; i < len(keys); i += 2 {

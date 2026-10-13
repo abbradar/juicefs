@@ -96,6 +96,26 @@ juicefs format redis://127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002/1 myjfs
 Redis Cluster does not support multiple databases. However, it splits the key space into 16384 hash slots, and distributes the slots to several nodes. Based on Redis Cluster's [Hash Tag](https://redis.io/docs/reference/cluster-spec/#hash-tags) feature, JuiceFS adds `{DB}` before all file system keys to ensure they will be hashed to the same hash slot, assuring that transactions can still work. Besides, one Redis Cluster can serve for multiple JuiceFS file systems as long as they use different db numbers.
 :::
 
+## Read replica {#read-replica}
+
+Clients far from the Redis master, for example in another region, can read metadata from a nearby replica, while writes still go to the master. Add `read-replica=HOST:PORT` to the metadata URL, for example:
+
+```shell
+juicefs mount --no-bgjob "redis://:password@master.example.com:6379/1?read-replica=127.0.0.1:6379" ~/jfs
+```
+
+The replica is accessed with the same database number, user, password and TLS settings as the master. Unlike `route-read`, this works for mounts that write too: every write waits until the replica has it, so the client and other clients using the same replica always read their own writes. Writes made through the master or other replicas become visible after the replication delay. Writes usually don't take longer, since the replication stream reaches a nearby replica about as fast as the reply of the master.
+
+Reads go to the master while the replica fails, is disconnected, or lags more than `read-replica-max-lag` behind the master (default `5s`). Writes don't wait more than `read-replica-timeout` for the replica (default `10s`); if they time out, reads go to the master until the replica catches up.
+
+Notes:
+
++ Set `replica-serve-stale-data no` on the replica, otherwise it may serve an empty database after a restart.
++ Checking the lag needs the `ROLE` command on the master and the replica, without it only failures and disconnections are detected.
++ JuiceFS increments the `replicaFence` key in every write to track which writes the replica has.
++ Client-side caching (`client-cache`) is disabled with a read replica, and Redis Cluster is not supported.
++ Background jobs write a lot, run them on clients close to the master and use `--no-bgjob` for the others.
+
 ## Data durability
 
 Redis provides various options for [persistence](https://redis.io/docs/manual/persistence) in different ranges:
@@ -248,6 +268,7 @@ If you want to use a Redis compatible product as the metadata engine, you need t
 + [DBSIZE](https://redis.io/commands/dbsize)
 + [FLUSHDB](https://redis.io/commands/flushdb) (optional)
 + [INFO](https://redis.io/commands/info)
++ [ROLE](https://redis.io/commands/role) (optional, to check the lag of a [read replica](#read-replica))
 
 #### Cluster management
 

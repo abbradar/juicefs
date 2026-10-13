@@ -96,6 +96,26 @@ juicefs format redis://127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002/1 myjfs
 Redis 集群不再支持多数据库，而是将所有 keys 分散到 16384 个 hash slots 中，再将这些 hash slots 打散到多个 Redis master 节点来存储。JuiceFS 利用了 Redis 集群的 [Hash Tag](https://redis.io/docs/reference/cluster-spec/#hash-tags) 特性，通过将 `{DB}` 作为 key 的前缀来将一个文件系统中的所有 keys 都存放在同一个 hash slot，以保证集群模式下操作的事务性。另外，通过设置不同的 `DB` 可以让一个 Redis 集群同时作为多个 JuiceFS 的元数据库。
 :::
 
+## 读副本 {#read-replica}
+
+距离 Redis 主节点较远的客户端（例如位于其他地域）可以从附近的副本读取元数据，写入仍然发往主节点。在元数据 URL 中加上 `read-replica=HOST:PORT` 即可，例如：
+
+```shell
+juicefs mount --no-bgjob "redis://:password@master.example.com:6379/1?read-replica=127.0.0.1:6379" ~/jfs
+```
+
+访问副本时使用与主节点相同的数据库编号、用户名、密码和 TLS 设置。与 `route-read` 不同，该功能也适用于需要写入的挂载点：每次写入都会等待副本收到这次写入，因此该客户端以及使用同一副本的其他客户端总能读到自己的写入。通过主节点或其他副本完成的写入会在复制延迟之后可见。写入的耗时通常不会增加，因为复制流到达附近副本的时间与主节点的回复相当。
+
+当副本出错、断开连接，或落后主节点超过 `read-replica-max-lag`（默认 `5s`）时，读请求会发往主节点。写入等待副本的时间不超过 `read-replica-timeout`（默认 `10s`）；如果超时，在副本追上之前读请求会发往主节点。
+
+注意：
+
++ 请在副本上设置 `replica-serve-stale-data no`，否则副本重启后可能会返回空的数据库。
++ 检查复制延迟需要在主节点和副本上执行 `ROLE` 命令，如果没有权限，则只能检测到出错和断开连接。
++ JuiceFS 在每次写入时会递增 `replicaFence` 键，用于跟踪副本已经收到哪些写入。
++ 使用读副本时会禁用客户端缓存（`client-cache`），并且不支持 Redis 集群。
++ 后台任务会产生大量写入，请在靠近主节点的客户端上运行，其他客户端使用 `--no-bgjob`。
+
 ## 数据持久性
 
 Redis 提供了不同范围的[持久性](https://redis.io/docs/manual/persistence)选项：
@@ -247,6 +267,7 @@ Redis 对数据备份非常友好，因为您可以在数据库运行时复制 R
 + [DBSIZE](https://redis.io/commands/dbsize)
 + [FLUSHDB](https://redis.io/commands/flushdb)（可选）
 + [INFO](https://redis.io/commands/info)
++ [ROLE](https://redis.io/commands/role)（可选，用于检查[读副本](#read-replica)的复制延迟）
 
 #### 集群管理
 
