@@ -1154,11 +1154,12 @@ func (m *redisMeta) doResolveCase(ctx Context, parent Ino, name string) (*Entry,
 	if !m.safeGlob {
 		return nil, syscall.ENOTSUP
 	}
+	cli := m.reader(ctx) // all pages from the same server
 	key := m.entryKey(parent)
 	pattern := caseInsensitiveGlob(name)
 	var cursor uint64
 	for {
-		kvs, next, err := m.rdb.HScan(ctx, key, cursor, pattern, 10000).Result()
+		kvs, next, err := cli.HScan(ctx, key, cursor, pattern, 10000).Result()
 		if err != nil {
 			return nil, err
 		}
