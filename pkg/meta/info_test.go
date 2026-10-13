@@ -62,6 +62,16 @@ func TestParseRedisVersion(t *testing.T) {
 			t.Fatalf("Expect %s, got %s", "6.2.19", ver)
 		}
 	})
+	t.Run("Should detect safe glob matching", func(t *testing.T) {
+		for v, safe := range map[string]bool{
+			"5.0.14": false, "6.0.17": false, "6.0.18": true, "6.1.240": false, "6.2.10": false, "6.2.11": true,
+			"6.3.4": false, "7.0.8": false, "7.0.9": true, "7.2.4": true, "8.2.1": true, "7.0": false, "invalid": false,
+		} {
+			if hasSafeGlob(v) != safe {
+				t.Fatalf("Expect %t for %s, got %t", safe, v, !safe)
+			}
+		}
+	})
 }
 
 func TestParseRedisInfo(t *testing.T) {
