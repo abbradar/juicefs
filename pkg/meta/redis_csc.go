@@ -30,13 +30,14 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 	"github.com/redis/go-redis/v9/push"
 )
 
+// cachedEntry maps a name to its inode, the attributes are in the inode cache
 type cachedEntry struct {
 	ino  Ino
 	term uint64
-	Attr
 }
 
 func (e *cachedEntry) isMark() bool {
@@ -47,6 +48,7 @@ func (e *cachedEntry) isMark() bool {
 // cache attrs and entries only, chunks are already cached in OpenCache
 type redisCache struct {
 	cli          *redis.Client
+	sub          *redis.Client // only for the subscription, which receives the invalidations
 	prefix       string
 	cap          int
 	expiry       time.Duration
@@ -71,8 +73,14 @@ func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *r
 	}
 }
 
+func (c *redisCache) purge() {
+	c.inodeCache.Purge()
+	c.entryCache.Purge()
+	c.entryTerms.Purge()
+}
+
 func (c *redisCache) init(cli redis.UniversalClient) error {
-	ctx := context.WithValue(context.Background(), invalidConnKey{}, true)
+	ctx := context.Background()
 	var err error
 	if rc, ok := cli.(*redis.Client); ok {
 		c.cli = rc
@@ -82,16 +90,21 @@ func (c *redisCache) init(cli redis.UniversalClient) error {
 			return err
 		}
 	}
-	c.cli.Options().OnConnect = c.onInvalidateConnect
-	// under the RESP3 protocol, "__redis__:invalidate" actually has no effect.
-	// we use Pubsub channel to simplify connection management and receiving PUSH messages.
-	c.subscription = c.cli.Subscribe(ctx, "__redis__:invalidate")
-	_ = c.subscription.Channel()
+	// A client of its own, so that tracking is enabled on every connection of the subscription,
+	// including the ones it reconnects with.
+	opt := *c.cli.Options()
+	opt.OnConnect = c.onTrackingConnect
+	opt.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
+	c.sub = redis.NewClient(&opt)
 	// handle PUSH notifications for invalidation in c.HandlePushNotification
-	if err = c.cli.RegisterPushNotificationHandler("invalidate", c, true); err != nil {
+	if err = c.sub.RegisterPushNotificationHandler("invalidate", c, true); err != nil {
 		c.close()
 		return err
 	}
+	// under the RESP3 protocol, "__redis__:invalidate" actually has no effect.
+	// we use Pubsub channel to simplify connection management and receiving PUSH messages.
+	c.subscription = c.sub.Subscribe(ctx, "__redis__:invalidate")
+	_ = c.subscription.Channel()
 	// handle client cmd to avoid race conditions
 	c.cli.AddHook(c)
 	return nil
@@ -133,10 +146,14 @@ func (c *redisCache) bumpEntryTerm(parent Ino) uint64 {
 }
 
 func (c *redisCache) HandlePushNotification(ctx context.Context, handlerCtx push.NotificationHandlerContext, notification []interface{}) error {
-	if len(notification) != 2 || notification[0] == nil || notification[1] == nil {
+	if len(notification) != 2 || notification[0] == nil {
 		return nil
 	}
 	if typ, ok := notification[0].(string); !ok || typ != "invalidate" {
+		return nil
+	}
+	if notification[1] == nil { // all keys, e.g. after FLUSHDB
+		c.purge()
 		return nil
 	}
 	iKeys, ok := notification[1].([]interface{})
@@ -170,17 +187,18 @@ func (c *redisCache) HandlePushNotification(ctx context.Context, handlerCtx push
 
 func (c *redisCache) DialHook(next redis.DialHook) redis.DialHook { return nil }
 
-var inodeMark []byte
-
-func (c *redisCache) beforeProcess(cmd redis.Cmder, skip bool) bool {
+// beforeProcess returns false if the reply was served from the cache. For a read of an inode which is not cached,
+// it returns the mark it placed: only this read may fill it, so that a reply older than an invalidation is dropped
+// even if another read placed a new mark since then.
+func (c *redisCache) beforeProcess(cmd redis.Cmder) (bool, []byte) {
 	name, args := cmd.Name(), cmd.Args()
 	var key string
 	var ok bool
 	if len(args) < 2 {
-		return true
+		return true, nil
 	}
 	if key, ok = args[1].(string); !ok {
-		return true
+		return true, nil
 	}
 	typ := c.parse(key)
 
@@ -189,23 +207,26 @@ func (c *redisCache) beforeProcess(cmd redis.Cmder, skip bool) bool {
 		if err == nil {
 			inode := Ino(num)
 			if data, ok := c.inodeCache.Get(inode); ok {
-				if !skip && len(data) > 0 {
+				if len(data) > 0 {
 					rsp := cmd.(*redis.StringCmd)
 					rsp.SetErr(nil)
 					rsp.SetVal(bytesToString(data))
-					return false
+					return false, nil
 				}
 			}
-			c.inodeCache.AddIf(inode, inodeMark, func(oldVal []byte, exists bool) bool {
+			mark := make([]byte, 0, 1) // distinct from other marks
+			if added, _ := c.inodeCache.AddIf(inode, mark, func(oldVal []byte, exists bool) bool {
 				return !exists
-			})
+			}); added {
+				return true, mark
+			}
 			// request to Redis server
 		}
 	}
-	return true
+	return true, nil
 }
 
-func (c *redisCache) afterProcess(cmd redis.Cmder) {
+func (c *redisCache) afterProcess(cmd redis.Cmder, mark []byte) {
 	name, args := cmd.Name(), cmd.Args()
 	var key string
 	var ok bool
@@ -219,15 +240,25 @@ func (c *redisCache) afterProcess(cmd redis.Cmder) {
 
 	switch name {
 	case "get":
-		if typ == keyTypInode {
+		if typ == keyTypInode && mark != nil {
 			if data, err := cmd.(*redis.StringCmd).Bytes(); err == nil {
 				num, err := strconv.ParseUint(key[len(c.prefix)+1:], 10, 64)
 				if err != nil {
 					return
 				}
 				_, _ = c.inodeCache.AddIf(Ino(num), data, func(oldVal []byte, exists bool) bool {
-					return exists && len(oldVal) == 0
+					return exists && len(oldVal) == 0 && unsafe.SliceData(oldVal) == unsafe.SliceData(mark)
 				})
+			}
+		}
+	case "del":
+		if cmd.Err() == nil {
+			for _, arg := range args[1:] {
+				if k, ok := arg.(string); ok && c.parse(k) == keyTypInode {
+					if num, err := strconv.ParseUint(k[len(c.prefix)+1:], 10, 64); err == nil {
+						_ = c.inodeCache.Remove(Ino(num))
+					}
+				}
 			}
 		}
 	case "set":
@@ -259,29 +290,26 @@ func (c *redisCache) afterProcess(cmd redis.Cmder) {
 
 func (c *redisCache) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		if !c.beforeProcess(cmd, false) {
+		send, mark := c.beforeProcess(cmd)
+		if !send {
 			return nil
 		}
 		err := next(ctx, cmd)
-		c.afterProcess(cmd)
+		c.afterProcess(cmd, mark)
 		return err
 	}
 }
 
+// ProcessPipelineHook drops what pipelines and transactions wrote, so that this client reads its own writes
+// without waiting for the invalidations. Reads in pipelines are not cached.
 func (c *redisCache) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return nil
-	/*
-		return func(ctx context.Context, cmds []redis.Cmder) error {
-			for _, cmd := range cmds {
-				_ = c.beforeProcess(cmd, true)
-			}
-			err := next(ctx, cmds)
-			for _, cmd := range cmds {
-				c.afterProcess(cmd)
-			}
-			return err
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		for _, cmd := range cmds {
+			c.afterProcess(cmd, nil)
 		}
-	*/
+		return err
+	}
 }
 
 func (c *redisCache) close() {
@@ -291,28 +319,22 @@ func (c *redisCache) close() {
 		}
 		c.subscription = nil
 	}
-	if c.cli != nil {
-		c.cli.Options().OnConnect = nil
+	if c.sub != nil {
+		_ = c.sub.Close()
+		c.sub = nil
 	}
 	c.cli = nil
 }
 
-type invalidConnKey struct{}
-
-func (c *redisCache) onInvalidateConnect(ctx context.Context, cn *redis.Conn) error {
-	if ctx.Value(invalidConnKey{}) == nil {
-		return nil
-	}
-	// clear all caches on reconnect
-	c.inodeCache.Purge()
-	c.entryCache.Purge()
-	c.entryTerms.Purge()
-	// use the pubsub connection to handle tracking and invalidate
-	_ = cn.Do(ctx, "CLIENT", "TRACKING", "OFF").Err()
+// onTrackingConnect enables tracking on a new connection of the subscription, and clears the caches,
+// which may have missed invalidations while it was not connected.
+func (c *redisCache) onTrackingConnect(ctx context.Context, cn *redis.Conn) error {
 	if err := cn.Do(ctx, "CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", c.prefix+"i", "PREFIX", c.prefix+"d").Err(); err != nil {
 		logger.Warnf("Failed to enable Redis client-side caching on new connection: %v", err)
 		return err
 	}
+	// after enabling tracking: the values read from now on get invalidated, and the reads in flight lose their marks
+	c.purge()
 	return nil
 }
 
@@ -333,16 +355,12 @@ func (m *redisMeta) preloadCache() {
 
 	term := m.cache.entryTerm(m.root)
 	var entries []*Entry
-	if eno := m.doReaddir(ctx, m.root, 1, &entries, m.cache.preload); eno != 0 {
+	if eno := m.doReaddir(ctx, m.root, 0, &entries, m.cache.preload); eno != 0 {
 		logger.Warnf("failed to read root %d directory: %d", m.root, eno)
 		return
 	}
 	for _, entry := range entries {
-		m.cache.entryCache.Add(m.cache.entryName(m.root, string(entry.Name)), &cachedEntry{
-			ino:  entry.Inode,
-			term: term,
-			Attr: *entry.Attr,
-		})
+		m.cache.entryCache.Add(m.cache.entryName(m.root, string(entry.Name)), &cachedEntry{ino: entry.Inode, term: term})
 	}
 	logger.Infof("preload %d inodes in %v", m.cache.inodeCache.Len(), time.Since(start))
 }
