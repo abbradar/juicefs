@@ -976,11 +976,9 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 		cacheKey = m.cache.entryName(parent, name)
 		entryTerm = m.cache.entryTerm(parent)
 		if entry, ok := m.cache.entryCache.Get(cacheKey); ok {
-			if entry.term >= entryTerm && !entry.isMark() {
+			// the attributes come from the inode cache, or a GET; if the inode is gone, look the entry up again
+			if entry.term >= entryTerm && !entry.isMark() && (attr == nil || m.doGetAttr(ctx, entry.ino, attr) == 0) {
 				*inode = entry.ino
-				if attr != nil {
-					*attr = entry.Attr
-				}
 				return 0
 			}
 		}
@@ -1016,9 +1014,7 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 		m.parseAttr(encodedAttr, attr)
 		m.of.Update(foundIno, attr)
 		if m.cache != nil {
-			ce := &cachedEntry{ino: foundIno, term: entryTerm}
-			m.parseAttr(encodedAttr, &ce.Attr)
-			_, _ = m.cache.entryCache.AddIf(cacheKey, ce, func(oldEntry *cachedEntry, exists bool) bool {
+			_, _ = m.cache.entryCache.AddIf(cacheKey, &cachedEntry{ino: foundIno, term: entryTerm}, func(oldEntry *cachedEntry, exists bool) bool {
 				return exists && oldEntry.isMark() && oldEntry.term == entryTerm && m.cache.entryTerm(parent) == entryTerm
 			})
 		}
